@@ -1,6 +1,0 @@
-logs（ログ）
-
-logs\
-├─ app\
-├─ db\
-└─ docker\
