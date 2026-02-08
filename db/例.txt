@@ -1,0 +1,7 @@
+db（DBまわり）
+
+db\
+├─ ddl\
+├─ dml\
+├─ testdata\
+└─ migration\

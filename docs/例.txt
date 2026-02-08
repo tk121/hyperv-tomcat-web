@@ -1,0 +1,12 @@
+docs（設計・調査）
+
+docs\
+├─ architecture.drawio
+├─ setup-memo.md
+└─ investigation\
+
+調査メモ
+
+手順書
+
+図

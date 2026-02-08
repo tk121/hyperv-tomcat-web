@@ -1,0 +1,6 @@
+vm（Hyper-V / VirtualBox）
+
+vm\
+├─ hyperv\
+│  └─ rhel8-oracle21c\
+└─ vbox\

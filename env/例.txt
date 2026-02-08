@@ -1,0 +1,10 @@
+env（環境依存ファイル）
+
+env\
+├─ app.env
+├─ db.env
+└─ .env.example
+
+本番 / 検証切り替え
+
+Docker / アプリ共通

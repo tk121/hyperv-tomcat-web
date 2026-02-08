@@ -1,0 +1,8 @@
+data（成果物・CSV）
+
+data\
+├─ input\
+├─ output\
+└─ compare\
+
+Excel / CSV / dump 置き場
