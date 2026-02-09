@@ -1,0 +1,9 @@
+target/
+data/
+db/
+docker/
+docs/
+env/
+logs/
+tools/
+vm/

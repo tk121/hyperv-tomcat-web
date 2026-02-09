@@ -1,12 +1,15 @@
-// replay.js (epochMs版)
-// - /myapp/api/history から履歴(JSON)を取得
-// - events[i].epochMs の差分で待ち時間を計算して iframe を遷移
-// - 後で「開始時刻から再生」を実装しやすいように startEpochMs を扱える形にしている
+// replay.js (ポーリングベース版)
+// - /myapp/api/history/info で総イベント数を取得
+// - /myapp/api/history?index=X で個別のイベント1つを取得
+// - 1秒周期でポーリングして次のデータを表示
+// - 巻き戻し・早送りは逆方向のポーリング
 
-let historyData = null;
-let isRunning = false;
+let totalEvents = 0;           // 総イベント数
+let isRunning = false;         // 再生中フラグ
+let currentIndex = -1;         // 現在表示中のイベントインデックス
+let isReverse = false;         // 逆方向フラグ（巻き戻し時用）
 
-let stepTimeoutId = null;    // 次の遷移予約(setTimeout)
+let pollIntervalId = null;     // 1秒周期ポーリング(setInterval)
 let countdownIntervalId = null; // カウントダウン表示(setInterval)
 
 function log(msg) {
@@ -25,9 +28,9 @@ function fmt(epochMs) {
 }
 
 function clearTimers() {
-  if (stepTimeoutId) {
-    clearTimeout(stepTimeoutId);
-    stepTimeoutId = null;
+  if (pollIntervalId) {
+    clearInterval(pollIntervalId);
+    pollIntervalId = null;
   }
   if (countdownIntervalId) {
     clearInterval(countdownIntervalId);
@@ -35,130 +38,224 @@ function clearTimers() {
   }
 }
 
+// ボタンの有効・無効状態を更新
+function updateButtonStates() {
+  if (isRunning) {
+    // 再生中：巻き戻し・早送りボタンを有効に
+    $("#btnRewind").prop("disabled", currentIndex <= 0);
+    $("#btnForward").prop("disabled", currentIndex >= totalEvents - 1);
+    $("#btnFastRewind").prop("disabled", currentIndex <= 1);
+    $("#btnFastForward").prop("disabled", currentIndex >= totalEvents - 2);
+  } else {
+    // 停止中：すべての操作ボタンを無効に
+    $("#btnRewind").prop("disabled", true);
+    $("#btnForward").prop("disabled", true);
+    $("#btnFastRewind").prop("disabled", true);
+    $("#btnFastForward").prop("disabled", true);
+  }
+}
+
 // stopボタンや最後まで再生したときに呼ぶ
 function stopReplay(reason) {
   isRunning = false;
+  isReverse = false;
   clearTimers();
 
-  $("#btnStart").prop("disabled", historyData == null);
+  $("#btnStart").prop("disabled", totalEvents === 0);
   $("#btnStop").prop("disabled", true);
   $("#countdown").text("---");
+  
+  updateButtonStates();
 
   if (reason) log("停止: " + reason);
 }
 
-// startEpochMs(任意) 以降の最初のイベントのindexを返す
-function findStartIndex(events, startEpochMs) {
-  if (startEpochMs == null) return 0;
-  for (let i = 0; i < events.length; i++) {
-    if (events[i].epochMs >= startEpochMs) return i;
-  }
-  // 指定時刻以降のイベントが無ければ最後
-  return Math.max(0, events.length - 1);
-}
-
-// i番目のイベントを表示し、次までの差分時間で次の表示を予約
-function playFromIndex(events, i) {
+// i番目のイベントを取得して表示
+function fetchAndDisplayEvent(index) {
   if (!isRunning) return;
 
-  if (i < 0 || i >= events.length) {
+  if (index < 0 || index >= totalEvents) {
     stopReplay("範囲外");
     return;
   }
 
-  const ev = events[i];
+  $.ajax({
+    url: "./api/history",
+    method: "GET",
+    data: { index: index },
+    dataType: "json",
+    cache: false,
+    timeout: 5000
+  })
+    .done(function (ev) {
+      currentIndex = index;
 
-  // 表示（左ペイン）
-  $("#current").text(`${ev.label}  ${ev.url}  (${fmt(ev.epochMs)})`);
-  // iframe遷移（右ペイン）
-  $("#viewer").attr("src", ev.url);
+      // 表示（左ペイン）
+      $("#current").text(`${ev.label}  ${ev.url}  (${fmt(ev.epochMs)})`);
+      $("#eventIndex").text(index + 1);
+      $("#totalEvents").text(totalEvents);
+      
+      // iframe遷移（右ペイン）
+      $("#viewer").attr("src", ev.url);
 
-  log(`表示: [${i}] ${ev.label}  epochMs=${ev.epochMs} (${fmt(ev.epochMs)}) -> ${ev.url}`);
+      log(`表示: [${index}] ${ev.label}  epochMs=${ev.epochMs} (${fmt(ev.epochMs)}) -> ${ev.url}`);
 
-  // 最後のイベントなら終了
-  if (i >= events.length - 1) {
-    $("#countdown").text("END");
-    stopReplay("最後まで再生しました");
-    return;
-  }
+      updateButtonStates();
 
-  // 次のイベントまでの待ち時間 = 次epochMs - 今epochMs
-  let waitMs = events[i + 1].epochMs - ev.epochMs;
+      // 範囲チェック：最後または最初に達したか
+      if (!isReverse && index >= totalEvents - 1) {
+        $("#countdown").text("END");
+        stopReplay("最後まで再生しました");
+        return;
+      }
+      if (isReverse && index <= 0) {
+        $("#countdown").text("START");
+        stopReplay("最初まで戻りました");
+        return;
+      }
 
-  // 異常値対策（同一時刻/逆転など）
-  if (!Number.isFinite(waitMs) || waitMs < 0) {
-    waitMs = 0;
-  }
+      // 次ポーリングまでの待機（カウントダウン表示）
+      let remain = 1000; // 1秒 = 1000ms
+      $("#countdown").text(remain);
 
-  // カウントダウン表示（100ms単位）
-  let remain = waitMs;
-  $("#countdown").text(remain);
+      if (countdownIntervalId) clearInterval(countdownIntervalId);
+      countdownIntervalId = setInterval(() => {
+        remain -= 100;
+        if (remain < 0) remain = 0;
+        $("#countdown").text(remain);
+      }, 100);
 
-  if (countdownIntervalId) clearInterval(countdownIntervalId);
-  countdownIntervalId = setInterval(() => {
-    remain -= 100;
-    if (remain < 0) remain = 0;
-    $("#countdown").text(remain);
-  }, 100);
-
-  // 次の表示を予約
-  stepTimeoutId = setTimeout(() => {
-    if (countdownIntervalId) {
-      clearInterval(countdownIntervalId);
-      countdownIntervalId = null;
-    }
-    playFromIndex(events, i + 1);
-  }, waitMs);
+      // 次のイベントを1秒後にポーリング
+      pollIntervalId = setTimeout(() => {
+        if (countdownIntervalId) {
+          clearInterval(countdownIntervalId);
+          countdownIntervalId = null;
+        }
+        const nextIndex = isReverse ? index - 1 : index + 1;
+        fetchAndDisplayEvent(nextIndex);
+      }, 1000);
+    })
+    .fail(function (xhr, status, err) {
+      log("取得失敗: " + status + " / HTTP " + xhr.status + " / " + err);
+      stopReplay("API呼び出しエラー");
+    });
 }
 
 function startReplay() {
-  if (!historyData || !Array.isArray(historyData.events) || historyData.events.length === 0) {
+  if (totalEvents === 0) {
     log("履歴がありません。先に「履歴取得」を押してください。");
     return;
   }
 
-  // epochMsで昇順に並べる
-  const events = historyData.events.slice().sort((a, b) => a.epochMs - b.epochMs);
-
-  // 将来拡張：開始時刻指定（いまは未入力なら先頭から）
-  // HTML側で input を用意したらここで読める：
-  // const startEpochMs = Number($("#startEpochMs").val()) || null;
-  const startEpochMs = null;
-
-  const startIndex = findStartIndex(events, startEpochMs);
+  // 入力フィールドから開始時刻を取得して開始インデックスを決定
+  // 簡略化のため、今は最初から再生（実装は後で可能）
+  const startIndex = 0;
 
   // 状態更新
   isRunning = true;
+  isReverse = false;
+  currentIndex = startIndex;
   clearTimers();
 
   $("#btnStart").prop("disabled", true);
   $("#btnStop").prop("disabled", false);
+  
+  updateButtonStates();
 
-  log("再生開始: startIndex=" + startIndex + (startEpochMs ? (" startEpochMs=" + startEpochMs) : ""));
+  log("再生開始: startIndex=" + startIndex);
 
-  playFromIndex(events, startIndex);
+  fetchAndDisplayEvent(startIndex);
+}
+
+// 巻き戻し（前のイベント）- 逆方向ポーリング開始
+function rewind() {
+  if (currentIndex <= 0) return;
+  
+  isRunning = true;
+  isReverse = true;
+  clearTimers();
+
+  $("#btnStart").prop("disabled", true);
+  $("#btnStop").prop("disabled", false);
+  
+  updateButtonStates();
+
+  log("巻き戻し開始");
+
+  fetchAndDisplayEvent(currentIndex - 1);
+}
+
+// 早送り（次のイベント）- 正方向ポーリング開始
+function forward() {
+  if (currentIndex >= totalEvents - 1) return;
+  
+  isRunning = true;
+  isReverse = false;
+  clearTimers();
+
+  $("#btnStart").prop("disabled", true);
+  $("#btnStop").prop("disabled", false);
+  
+  updateButtonStates();
+
+  log("早送り開始");
+
+  fetchAndDisplayEvent(currentIndex + 1);
+}
+
+// 2倍速巻き戻し（2つ前へ）
+function fastRewind() {
+  if (currentIndex <= 1) return;
+  
+  isRunning = true;
+  isReverse = true;
+  clearTimers();
+
+  $("#btnStart").prop("disabled", true);
+  $("#btnStop").prop("disabled", false);
+  
+  updateButtonStates();
+
+  log("2倍速巻き戻し開始");
+
+  fetchAndDisplayEvent(currentIndex - 2);
+}
+
+// 2倍速早送り（2つ先へ）
+function fastForward() {
+  if (currentIndex >= totalEvents - 2) return;
+  
+  isRunning = true;
+  isReverse = false;
+  clearTimers();
+
+  $("#btnStart").prop("disabled", true);
+  $("#btnStop").prop("disabled", false);
+  
+  updateButtonStates();
+
+  log("2倍速早送り開始");
+
+  fetchAndDisplayEvent(currentIndex + 2);
 }
 
 // ボタンイベント
 $("#btnLoad").on("click", function () {
-  log("履歴取得中...");
+  log("履歴情報取得中...");
 
   $.ajax({
-    url: "./api/history",   // /myapp/api/history
+    url: "./api/history/info",
     method: "GET",
     dataType: "json",
     cache: false,
     timeout: 5000
   })
     .done(function (data) {
-      historyData = data;
-
-      // 軽く検証（epochMsが数値か）
-      const ok = Array.isArray(data.events) && data.events.every(e => typeof e.epochMs === "number" && typeof e.url === "string");
-      log("取得しました。検証=" + (ok ? "OK" : "NG(形式要確認)"));
-      log(JSON.stringify(data, null, 2));
+      totalEvents = data.totalEvents;
+      log("取得しました。総イベント数: " + totalEvents);
 
       $("#btnStart").prop("disabled", false);
+      updateButtonStates();
     })
     .fail(function (xhr, status, err) {
       log("取得失敗: " + status + " / HTTP " + xhr.status + " / " + err);
@@ -170,3 +267,8 @@ $("#btnStart").on("click", startReplay);
 $("#btnStop").on("click", function () {
   stopReplay("ユーザー操作");
 });
+
+$("#btnRewind").on("click", rewind);
+$("#btnForward").on("click", forward);
+$("#btnFastRewind").on("click", fastRewind);
+$("#btnFastForward").on("click", fastForward);
