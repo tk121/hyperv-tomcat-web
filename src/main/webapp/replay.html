@@ -20,7 +20,9 @@
       <div>
         <label>開始日時: </label>
         <input id="startDateTime" type="datetime-local" style="width:180px;" />
-        <button id="btnLoad">履歴取得</button>
+        <label style="margin-left:8px;">秒: </label>
+        <input id="startSeconds" type="number" min="0" max="59" value="0" style="width:40px;" />
+        <button id="btnLoad" style="margin-left:8px;">履歴取得</button>
         <button id="btnStart" disabled>再生開始</button>
         <button id="btnStop" disabled>停止</button>
       </div>
