@@ -22,8 +22,9 @@
         <input id="startDateTime" type="datetime-local" style="width:180px;" />
         <label style="margin-left:8px;">秒: </label>
         <input id="startSeconds" type="number" min="0" max="59" value="0" style="width:40px;" />
-        <button id="btnLoad" style="margin-left:8px;">履歴取得</button>
-        <button id="btnStart" disabled>再生開始</button>
+      </div>
+      <div style="margin-top:8px;">
+        <button id="btnStart">再生開始</button>
         <button id="btnStop" disabled>停止</button>
       </div>
       <div style="margin-top:8px;">
@@ -33,7 +34,7 @@
         <button id="btnFastRewind" disabled title="2つ前へスキップ">⏪ 2倍速巻戻</button>
       </div>
       <p>現在: <span id="current">---</span></p>
-      <p>イベント: <span id="eventIndex">-</span> / <span id="totalEvents">-</span></p>
+      <p>イベント: <span id="eventIndex">-</span></p>
       <p>次まで: <span id="countdown">---</span> ms</p>
       <div class="log" id="log"></div>
     </div>

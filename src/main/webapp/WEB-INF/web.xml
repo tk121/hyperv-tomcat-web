@@ -5,31 +5,14 @@
     version="4.0">
 
     <servlet>
-        <servlet-name>TimeServlet</servlet-name>
-        <servlet-class>demo.TimeServlet</servlet-class>
-        <load-on-startup>1</load-on-startup>
-    </servlet>
-
-    <servlet>
-        <servlet-name>HistoryServlet</servlet-name>
-        <servlet-class>demo.HistoryServlet</servlet-class>
-        <load-on-startup>1</load-on-startup>
-    </servlet>
-
-    <servlet>
         <servlet-name>ReplayServlet</servlet-name>
         <servlet-class>demo.ReplayServlet</servlet-class>
         <load-on-startup>1</load-on-startup>
     </servlet>
 
     <servlet-mapping>
-        <servlet-name>TimeServlet</servlet-name>
-        <url-pattern>/api/time</url-pattern>
-    </servlet-mapping>
-
-    <servlet-mapping>
         <servlet-name>ReplayServlet</servlet-name>
-        <url-pattern>/api/history/*</url-pattern>
+        <url-pattern>/api/replay/*</url-pattern>
     </servlet-mapping>
 
 </web-app>

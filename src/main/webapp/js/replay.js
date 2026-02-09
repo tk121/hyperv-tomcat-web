@@ -20,15 +20,17 @@
 // - 再生中：巻き戻し・早送りボタンを有効化（マニュアル操作可能）
 // - 停止中：すべての操作ボタンを無効化
 
-let totalEvents = 0;           // 総イベント数（初期化時に /api/history/info から取得）
 let isRunning = false;         // 再生・巻き戻し・早送りの実行フラグ（ポーリング中 = true）
-let currentIndex = -1;         // 現在表示中のイベントインデックス（0～totalEvents-1）
+let currentIndex = -1;         // 現在表示中のイベントインデックス
 let isReverse = false;         // 逆方向フラグ：true = 巻き戻し中、false = 再生/早送り中
+let lastDisplayedEpochMs = 0;  // 最後に表示したイベントのepochMs
+let lastFetchedEvent = null;   // ポーリングで取得したが未表示のイベント
 
-let pollIntervalId = null;     // 1秒周期ポーリング予約用（setTimeout）
+let pollIntervalId = null;     // 1秒周期ポーリング予約用（setInterval）
+let displayTimerIdId = null;   // 画面表示切り替え予約用（setTimeout）
 let countdownIntervalId = null; // カウントダウン表示用（setInterval）更新は100ms単位
 
-let serverEpochMs = 0;         // サーバーが計測した時刻（/info から取得）
+let serverEpochMs = 0;         // サーバーが計測した時刻（初回イベント取得時に取得）
 let clientEpochMsAtInit = 0;   // 「履歴取得」実行時のクライアント側時刻
 
 /**
@@ -58,13 +60,17 @@ function fmt(epochMs) {
 
 /**
  * clearTimers()
- * 実行中のポーリング・カウントダウンタイマーをすべてクリア
+ * 実行中のポーリング・表示切り替え・カウントダウンタイマーをすべてクリア
  * 再生停止時、または次のアクション開始時に呼び出す
  */
 function clearTimers() {
   if (pollIntervalId) {
     clearInterval(pollIntervalId);
     pollIntervalId = null;
+  }
+  if (displayTimerIdId) {
+    clearTimeout(displayTimerIdId);
+    displayTimerIdId = null;
   }
   if (countdownIntervalId) {
     clearInterval(countdownIntervalId);
@@ -77,15 +83,14 @@ function clearTimers() {
  * 再生状態に応じて各操作ボタンの有効・無効状態を更新
  * - 再生中: 巻き戻し・早送りボタンを有効（マニュアル操作可能）
  * - 停止中: すべてのボタンを無効
- * - 範囲チェック: 最初/最後の位置に応じてボタンを無効化
  */
 function updateButtonStates() {
   if (isRunning) {
     // 再生中：巻き戻し・早送りボタンを有効に
     $("#btnRewind").prop("disabled", currentIndex <= 0);
-    $("#btnForward").prop("disabled", currentIndex >= totalEvents - 1);
+    $("#btnForward").prop("disabled", false);
     $("#btnFastRewind").prop("disabled", currentIndex <= 1);
-    $("#btnFastForward").prop("disabled", currentIndex >= totalEvents - 2);
+    $("#btnFastForward").prop("disabled", false);
   } else {
     // 停止中：すべての操作ボタンを無効に
     $("#btnRewind").prop("disabled", true);
@@ -108,7 +113,7 @@ function stopReplay(reason) {
   isReverse = false;
   clearTimers();
 
-  $("#btnStart").prop("disabled", totalEvents === 0);
+  $("#btnStart").prop("disabled", false);
   $("#btnStop").prop("disabled", true);
   $("#countdown").text("---");
   
@@ -118,102 +123,190 @@ function stopReplay(reason) {
 }
 
 /**
- * fetchAndDisplayEvent(index)
- * 指定インデックスのイベントを非同期で取得・表示する（ポーリング中核関数）
- * 
- * 【処理フロー】
- * 1. index値をバリデーション（0～totalEvents-1）
- * 2. /api/history?index=X にGET送信
- * 3. レスポンス受信後、UIを更新
- *    - 左ペイン: ラベル＆URL＆時刻を表示
- *    - 右ペイン: iframe のsrc を変更（ページ遷移）
- * 4. 最後/最初に達したかチェック → 達したら停止
- * 5. 1000ms(1秒) 後に次のイベントをポーリング
- *    - isReverse=false (再生/早送り): index → index+1
- *    - isReverse=true (巻き戻し): index → index-1
+ * pollNextEvent(index)
+ * 1秒ごとにサーバーからイベントをポーリング
+ * 【重要】イベント取得のみ、表示はしない（バッファに保持）
+ * 表示タイミングは scheduleEventDisplay() で別途制御
  */
-function fetchAndDisplayEvent(index) {
+function pollNextEvent(index) {
   if (!isRunning) return;
 
-  if (index < 0 || index >= totalEvents) {
+  if (index < 0) {
     stopReplay("範囲外");
     return;
   }
 
   $.ajax({
-    url: "./api/history",
+    url: "./api/replay/history",
     method: "GET",
-    data: { index: index },
+    data: { 
+      index: index
+    },
     dataType: "json",
     cache: false,
     timeout: 5000
   })
     .done(function (ev) {
-      currentIndex = index;
+      // イベント取得成功 → バッファに保持するだけ（表示はしない）
+      log(`ポーリング成功: [${index}] ${ev.label}  epochMs=${ev.epochMs} (${fmt(ev.epochMs)})`);
 
-      // 表示（左ペイン）
-      $("#current").text(`${ev.label}  ${ev.url}  (${fmt(ev.epochMs)})`);
-      $("#eventIndex").text(index + 1);
-      $("#totalEvents").text(totalEvents);
+      // 最後のイベントかチェック
+      if (ev.nextEpochMs === undefined || ev.nextEpochMs === null) {
+        log("最後のイベントをポーリング");
+        lastFetchedEvent = { event: ev, index: index };
+      } else {
+        lastFetchedEvent = { event: ev, index: index };
+      }
       
-      // iframe遷移（右ペイン）
-      $("#viewer").attr("src", ev.url);
-
-      log(`表示: [${index}] ${ev.label}  epochMs=${ev.epochMs} (${fmt(ev.epochMs)}) -> ${ev.url}`);
-
-      updateButtonStates();
-
-      // 範囲チェック：最後または最初に達したか
-      if (!isReverse && index >= totalEvents - 1) {
-        $("#countdown").text("END");
-        stopReplay("最後まで再生しました");
-        return;
-      }
-      if (isReverse && index <= 0) {
-        $("#countdown").text("START");
-        stopReplay("最初まで戻りました");
-        return;
-      }
-
-      // 次ポーリングまでの待機（カウントダウン表示）
-      let remain = 1000; // 1秒 = 1000ms
-      $("#countdown").text(remain);
-
-      if (countdownIntervalId) clearInterval(countdownIntervalId);
-      countdownIntervalId = setInterval(() => {
-        remain -= 100;
-        if (remain < 0) remain = 0;
-        $("#countdown").text(remain);
-      }, 100);
-
-      // 次のイベントを1秒後にポーリング
-      pollIntervalId = setTimeout(() => {
-        if (countdownIntervalId) {
-          clearInterval(countdownIntervalId);
-          countdownIntervalId = null;
-        }
-        const nextIndex = isReverse ? index - 1 : index + 1;
-        fetchAndDisplayEvent(nextIndex);
-      }, 1000);
+      // 表示タイミングをチェック
+      scheduleEventDisplay();
     })
     .fail(function (xhr, status, err) {
-      log("取得失敗: " + status + " / HTTP " + xhr.status + " / " + err);
-      stopReplay("API呼び出しエラー");
+      // ポーリング失敗（データなし）
+      if (xhr.status === 400) {
+        log(`イベント [${index}] が見つかりません`);
+      } else {
+        log(`ポーリング失敗: status=${xhr.status}`);
+      }
     });
 }
 
 /**
+ * displayEvent(ev, index)
+ * イベントを画面に表示する
+ */
+function displayEvent(ev, index) {
+  currentIndex = index;
+  lastDisplayedEpochMs = ev.epochMs;
+
+  // 表示（左ペイン）
+  $("#current").text(`${ev.label}  ${ev.url}  (${fmt(ev.epochMs)})`);
+  $("#eventIndex").text(index + 1);
+  
+  // iframe遷移（右ペイン）
+  $("#viewer").attr("src", ev.url);
+
+  log(`表示: [${index}] ${ev.label} -> ${ev.url}`);
+  updateButtonStates();
+}
+
+/**
+ * scheduleEventDisplay()
+ * 
+ * 【重要な処理】
+ * ポーリングで取得したイベント（lastFetchedEvent）が
+ * 実際に表示するべき時刻に達したかを確認
+ * 
+ * 達していれば → 画面に表示
+ * 達していなければ → 待機タイマーをセット
+ */
+function scheduleEventDisplay() {
+  if (!lastFetchedEvent) return;
+  
+  const ev = lastFetchedEvent.event;
+  const index = lastFetchedEvent.index;
+  const targetTime = ev.epochMs;  // このイベントを表示すべき時刻
+  const nowMs = new Date().getTime();
+  const timeDiff = targetTime - nowMs;
+  
+  if (timeDiff <= 100) {  // 100ms以内なら表示
+    // 表示時刻到達 → 画面に表示
+    displayEvent(ev, index);
+    lastDisplayedEpochMs = ev.epochMs;
+    lastFetchedEvent = null;  // バッファクリア
+    
+    log(`表示時刻到達、画面遷移: [${index}] ${ev.label}`);
+    
+    // 次のイベント表示予約（あれば）
+    if (ev.nextEpochMs) {
+      const nextWaitMs = ev.nextEpochMs - nowMs;
+      if (displayTimerIdId) clearTimeout(displayTimerIdId);
+      displayTimerIdId = setTimeout(() => {
+        scheduleEventDisplay();
+      }, Math.max(100, nextWaitMs));
+      
+      // カウントダウン表示
+      let remain = nextWaitMs;
+      $("#countdown").text(Math.ceil(remain / 1000) + "秒");
+      if (countdownIntervalId) clearInterval(countdownIntervalId);
+      countdownIntervalId = setInterval(() => {
+        remain -= 100;
+        if (remain < 0) remain = 0;
+        $("#countdown").text(Math.ceil(remain / 1000) + "秒");
+      }, 100);
+    } else {
+      // 最後のイベント
+      $("#countdown").text("---");
+      stopReplay("最後まで再生しました");
+    }
+  } else {
+    // 待機中 → 表示時刻になるまで待つ
+    log(`イベント [${index}] バッファ保持中、次表示時刻まで ${Math.ceil(timeDiff / 1000)}秒待機`);
+    
+    if (displayTimerIdId) clearTimeout(displayTimerIdId);
+    displayTimerIdId = setTimeout(() => {
+      scheduleEventDisplay();
+    }, Math.max(100, timeDiff));
+    
+    // カウントダウン表示
+    let remain = timeDiff;
+    $("#countdown").text(Math.ceil(remain / 1000) + "秒");
+    if (countdownIntervalId) clearInterval(countdownIntervalId);
+    countdownIntervalId = setInterval(() => {
+      remain -= 100;
+      if (remain < 0) remain = 0;
+      $("#countdown").text(Math.ceil(remain / 1000) + "秒");
+    }, 100);
+  }
+}
+
+/**
+ * fetchAndDisplayEvent(index)
+ * 【非推奨 - 以前のシングルポーリング方式】
+ * 代わりに pollNextEvent() を使用
+ * （displayEventWithDelay() は削除）
+ */
+function fetchAndDisplayEvent(index) {
+  // 互換性のため残すが、実際には使用されない
+  pollNextEvent(index);
+}
+
+/**
  * startReplay()
- * 再生を開始する
- * - 開始日時が指定されている場合は /api/history/find でindexを取得
- * - 指定なしの場合は index=0 から開始
- * - フラグ設定: isRunning=true, isReverse=false
- * - UI更新: ボタン有効・無効状態を更新
- * - ポーリング開始: fetchAndDisplayEvent(index) を呼び出し
+ * 再生開始メインルーチン（最初のイベントから開始）
+ * 
+ * 【処理フロー】
+ * 1. サーバー疎通がなければ先に取得
+ * 2. index=0 から再生開始（常に最初から）
  */
 function startReplay() {
-  if (totalEvents === 0) {
-    log("履歴がありません。先に「履歴取得」を押してください。");
+  // サーバー疎通がなければまずサーバーから初期情報を取得
+  if (!serverEpochMs) {
+    log("サーバーと疎通中...");
+    
+    $.ajax({
+      url: "./api/replay/history",
+      method: "GET",
+      data: { 
+        index: 0
+      },
+      dataType: "json",
+      cache: false,
+      timeout: 5000
+    })
+      .done(function (data) {
+        // サーバー時刻を保存
+        serverEpochMs = new Date().getTime();
+        clientEpochMsAtInit = new Date().getTime();
+        
+        log("サーバー疎通確立: " + fmt(serverEpochMs));
+        
+        // 再帰的に startReplay() を呼び出して処理を続行
+        startReplay();
+      })
+      .fail(function (xhr, status, err) {
+        log("❌ サーバー疎通失敗: " + status + " / HTTP " + xhr.status + " / " + err);
+      });
     return;
   }
 
@@ -230,8 +323,6 @@ function startReplay() {
     }
   }
   
-  log("startReplay called - dateTime: " + startDateTimeStr + ", seconds: " + startSeconds);
-  
   if (!startDateTimeStr) {
     // 開始日時が指定されていない場合は index=0 から開始
     log("開始日時が指定されていません。index=0 から開始します");
@@ -240,7 +331,6 @@ function startReplay() {
   }
 
   // datetime-local形式 (YYYY-MM-DDTHH:mm) をローカルタイムゾーン として Date に変換
-  // 注意: new Date(datetimeLocalString) は UTC として解釈されるため、手動でローカルタイムゾーン に変換
   const parts = startDateTimeStr.split('T');
   const dateParts = parts[0].split('-'); // YYYY-MM-DD
   const timeParts = parts[1].split(':'); // HH:mm
@@ -273,9 +363,9 @@ function startReplay() {
   log("補正後の検索時刻: " + fmt(startEpochMs) + " (サーバー時刻軸)");
   log("開始時刻を検索中... epochMs=" + startEpochMs + " (" + fmt(startEpochMs) + ")");
 
-  // サーバー側に /api/history/find?epochMs=XXX でindexを取得
+  // サーバー側に /api/replay/history/find?epochMs=XXX でindexを取得
   $.ajax({
-    url: "./api/history/find",
+    url: "./api/replay/history/find",
     method: "GET",
     data: { epochMs: startEpochMs },
     dataType: "json",
@@ -288,18 +378,24 @@ function startReplay() {
       startPlaybackFromIndex(startIndex);
     })
     .fail(function (xhr, status, err) {
-      log("開始位置取得失敗: " + status + " / HTTP " + xhr.status + " / " + err);
-      log("フォールバック: index=0 から開始します");
-      startPlaybackFromIndex(0);
+      log("❌ 開始位置取得失敗: " + status + " / HTTP " + xhr.status + " / " + err);
+      if (xhr.status === 400) {
+        log("⚠ 指定時刻のイベントが見つかりません");
+      }
     });
 }
 
 /**
  * startPlaybackFromIndex(index)
  * 指定インデックスから再生を開始する（内部用ヘルパー関数）
- * - フラグ設定: isRunning=true, isReverse=false
- * - UI更新: ボタン有効・無効状態を更新
- * - ポーリング開始: fetchAndDisplayEvent(index) を呼び出し
+ * 
+ * 【処理フロー】
+ * 1. フラグ設定: isRunning=true, isReverse=false, currentIndex=startIndex
+ * 2. UI更新: ボタン有効・無効状態を更新
+ * 3. 【重要】1秒ごとの定期ポーリングを開始
+ *    - setInterval() で pollNextEvent(currentIndex) を実行
+ *    - currentIndex は毎回、前のループで自動更新される
+ * 4. 初回イベント表示
  */
 function startPlaybackFromIndex(startIndex) {
   // 状態更新
@@ -315,7 +411,17 @@ function startPlaybackFromIndex(startIndex) {
 
   log("再生開始: startIndex=" + startIndex);
 
-  fetchAndDisplayEvent(startIndex);
+  // 【重要】1秒ごとのポーリングを開始
+  // setInterval で毎秒 pollNextEvent() を実行
+  pollIntervalId = setInterval(() => {
+    if (isRunning) {
+      const nextIndex = isReverse ? currentIndex - 1 : currentIndex + 1;
+      pollNextEvent(nextIndex);
+    }
+  }, 1000);
+
+  // 初回イベント表示
+  pollNextEvent(startIndex);
 }
 
 /**
@@ -323,8 +429,7 @@ function startPlaybackFromIndex(startIndex) {
  * 1つ前のイベントへ巻き戻す
  * - current index が 0以下 → 無処理
  * - isReverse = true に設定（逆方向ポーリング）
- * - fetchAndDisplayEvent(currentIndex - 1) を呼び出し
- * - 1つ前を現在地として、そこから1秒待機開始
+ * - startPlaybackFromIndex() と同じ方式で1秒ごとのポーリングを開始
  */
 function rewind() {
   if (currentIndex <= 0) return;
@@ -340,19 +445,25 @@ function rewind() {
 
   log("巻き戻し開始");
 
-  fetchAndDisplayEvent(currentIndex - 1);
+  // 1秒ごとのポーリングを開始
+  pollIntervalId = setInterval(() => {
+    if (isRunning) {
+      const nextIndex = isReverse ? currentIndex - 1 : currentIndex + 1;
+      pollNextEvent(nextIndex);
+    }
+  }, 1000);
+
+  // 初回イベント表示
+  pollNextEvent(currentIndex - 1);
 }
 
 /**
  * forward()
  * 1つ先のイベントへ早送りする
- * - currentIndex >= totalEvents-1 → 無処理
  * - isReverse = false に設定（正方向ポーリング）
- * - fetchAndDisplayEvent(currentIndex + 1) を呼び出し
+ * - startPlaybackFromIndex() と同じ方式で1秒ごとのポーリングを開始
  */
 function forward() {
-  if (currentIndex >= totalEvents - 1) return;
-  
   isRunning = true;
   isReverse = false;
   clearTimers();
@@ -364,7 +475,16 @@ function forward() {
 
   log("早送り開始");
 
-  fetchAndDisplayEvent(currentIndex + 1);
+  // 1秒ごとのポーリングを開始
+  pollIntervalId = setInterval(() => {
+    if (isRunning) {
+      const nextIndex = isReverse ? currentIndex - 1 : currentIndex + 1;
+      pollNextEvent(nextIndex);
+    }
+  }, 1000);
+
+  // 初回イベント表示
+  pollNextEvent(currentIndex + 1);
 }
 
 /**
@@ -372,7 +492,7 @@ function forward() {
  * 2つ前のイベントへ高速巻き戻す
  * - currentIndex <= 1 → 無処理
  * - isReverse = true に設定
- * - fetchAndDisplayEvent(currentIndex - 2) を呼び出し
+ * - startPlaybackFromIndex() と同じ方式で1秒ごとのポーリングを開始
  */
 function fastRewind() {
   if (currentIndex <= 1) return;
@@ -388,19 +508,25 @@ function fastRewind() {
 
   log("2倍速巻き戻し開始");
 
-  fetchAndDisplayEvent(currentIndex - 2);
+  // 1秒ごとのポーリングを開始
+  pollIntervalId = setInterval(() => {
+    if (isRunning) {
+      const nextIndex = isReverse ? currentIndex - 1 : currentIndex + 1;
+      pollNextEvent(nextIndex);
+    }
+  }, 1000);
+
+  // 初回イベント表示
+  pollNextEvent(currentIndex - 2);
 }
 
 /**
  * fastForward()
  * 2つ先のイベントへ高速早送りする
- * - currentIndex >= totalEvents-2 → 無処理
  * - isReverse = false に設定
- * - fetchAndDisplayEvent(currentIndex + 2) を呼び出し
+ * - startPlaybackFromIndex() と同じ方式で1秒ごとのポーリングを開始
  */
 function fastForward() {
-  if (currentIndex >= totalEvents - 2) return;
-  
   isRunning = true;
   isReverse = false;
   clearTimers();
@@ -412,7 +538,16 @@ function fastForward() {
 
   log("2倍速早送り開始");
 
-  fetchAndDisplayEvent(currentIndex + 2);
+  // 1秒ごとのポーリングを開始
+  pollIntervalId = setInterval(() => {
+    if (isRunning) {
+      const nextIndex = isReverse ? currentIndex - 1 : currentIndex + 1;
+      pollNextEvent(nextIndex);
+    }
+  }, 1000);
+
+  // 初回イベント表示
+  pollNextEvent(currentIndex + 2);
 }
 
 // ============================================
@@ -420,42 +555,14 @@ function fastForward() {
 // ============================================
 
 /**
- * 「履歴取得」ボタンクリック
- * - /api/history/info へアクセス
- * - 総イベント数を取得・保持
- * - サーバー時刻を保存（クライアント時刻のズレ補正用）
- * - 「再生開始」ボタンを有効化
+ * 「履歴取得」ボタンは不要：再生開始時に自動取得されます
+ * （以前のハンドラは削除）
  */
-$("#btnLoad").on("click", function () {
-  log("履歴情報取得中...");
-
-  $.ajax({
-    url: "./api/history/info",
-    method: "GET",
-    dataType: "json",
-    cache: false,
-    timeout: 5000
-  })
-    .done(function (data) {
-      totalEvents = data.totalEvents;
-      serverEpochMs = data.generatedAtEpochMs;      // サーバー時刻を保存
-      clientEpochMsAtInit = new Date().getTime();   // クライアント現在時刻を保存
-      
-      const timeDiffMs = serverEpochMs - clientEpochMsAtInit;
-      log("取得しました。総イベント数: " + totalEvents);
-      log("サーバー時刻: " + fmt(serverEpochMs) + " (オフセット: " + timeDiffMs + "ms)");
-
-      $("#btnStart").prop("disabled", false);
-      updateButtonStates();
-    })
-    .fail(function (xhr, status, err) {
-      log("取得失敗: " + status + " / HTTP " + xhr.status + " / " + err);
-    });
-});
 
 /**
  * 「再生開始」ボタンクリック
  * startReplay() を呼び出す
+ * - サーバー疎通がなければ自動取得してから再生開始
  */
 $("#btnStart").on("click", startReplay);
 
